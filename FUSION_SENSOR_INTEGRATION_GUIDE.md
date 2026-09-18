@@ -22,33 +22,32 @@ This project adds the following features:
 
 1. The x-io Technologies Fusion 1.3.3 C library is compiled into the Zephyr
    application.
-2. A Simple Fusion thread runs a gyroscope-and-accelerometer AHRS algorithm at
-   100 Hz.
-3. An Advanced Fusion thread runs gyroscope bias correction, sensor
-   calibration, a gyroscope/accelerometer/magnetometer AHRS algorithm, and
-   earth-frame acceleration calculation at 100 Hz.
-4. Fusion results are sent to the phone through the existing NUS TX
+2. The Zephyr LSM6DSO driver reads synchronized gyroscope and accelerometer
+   samples over SPI21 at 104 Hz.
+3. A Simple Fusion thread runs a gyroscope-and-accelerometer AHRS algorithm at
+   104 Hz.
+4. An Advanced Fusion thread runs gyroscope bias correction, sensor
+   calibration, a gyroscope-and-accelerometer AHRS algorithm, and earth-frame
+   acceleration calculation at 104 Hz.
+5. Fusion results are sent to the phone through the existing NUS TX
    characteristic.
-5. Simple and Advanced messages are staggered to reduce competition for BLE
+6. Simple and Advanced messages are staggered to reduce competition for BLE
    transmit buffers.
-6. Long NUS messages can be divided into payloads of no more than 20 bytes.
-7. Floating-point text formatting is enabled for one-decimal-place output.
+7. Long NUS messages can be divided into payloads of no more than 20 bytes.
+8. Floating-point text formatting is enabled for one-decimal-place output.
 
 The original UART-to-NUS and NUS-to-UART paths remain available.
 
-## 3. Current Demonstration Data
+## 3. Current Sensor Data
 
-The application does not currently read a physical IMU. Both Fusion threads
-use the same stationary placeholder measurements as the upstream examples:
+The application reads real LSM6DSO hardware data through the Zephyr Sensor
+API. A dedicated acquisition thread converts gyroscope values from radians per
+second to degrees per second and acceleration values from metres per second
+squared to g. The same timestamped sample is copied to separate queues for the
+Simple and Advanced Fusion threads.
 
-```text
-Gyroscope:     0, 0, 0 degrees/second
-Accelerometer: 0, 0, 1 g
-Magnetometer:  1, 0, 0 calibrated units (Advanced only)
-```
-
-Consequently, the values normally remain close to zero. Moving the nRF54L15
-DK will not change the output until real sensor samples are connected.
+The LSM6DSO has no magnetometer. Both algorithms therefore use
+`FusionAhrsUpdateNoMagnetometer()`, and yaw may drift over time.
 
 ## 4. NUS Output
 
@@ -104,9 +103,13 @@ target_sources(app PRIVATE
 ### `prj.conf`
 
 The original Bluetooth, NUS, UART, settings, and logging configuration remains
-enabled. The project also enables floating-point formatting:
+enabled. The project also enables the Zephyr sensor subsystem, LSM6DSO driver,
+SPI, and floating-point formatting:
 
 ```text
+CONFIG_SPI=y
+CONFIG_SENSOR=y
+CONFIG_LSM6DSO=y
 CONFIG_CBPRINTF_FP_SUPPORT=y
 ```
 
@@ -121,10 +124,19 @@ The main additions are identified by these symbols:
 
 - `nus_send_data()` serializes NUS submissions and divides data into safe
   20-byte payloads.
+- `sensor_acquisition_thread()` reads the LSM6DSO and distributes timestamped
+  samples through `simple_imu_queue` and `advanced_imu_queue`.
 - `fusion_thread()` implements the Simple example.
 - `fusion_advanced_thread()` implements the Advanced example.
-- `nus_init_ok` prevents both Fusion threads from running before NUS is ready.
-- `FUSION_SAMPLE_RATE_HZ` defines the current 100 Hz algorithm rate.
+- `nus_init_ok` prevents the acquisition and Fusion threads from running before
+  NUS is ready.
+- `FUSION_SAMPLE_RATE_HZ` defines the current 104 Hz algorithm rate.
+
+### `boards/nrf54l15dk_nrf54l15_cpuapp.overlay`
+
+The overlay connects the Zephyr LSM6DSO device to SPI21 at 1 MHz. It configures
+the accelerometer for +/-2 g at 104 Hz and the gyroscope for +/-250 degrees per
+second at 104 Hz.
 
 The original `ble_write_thread()` still forwards physical UART input to NUS.
 It now uses `nus_send_data()` so its transmissions are serialized with Fusion

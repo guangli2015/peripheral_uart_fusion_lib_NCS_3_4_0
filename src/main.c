@@ -11,6 +11,7 @@
 
 #include <zephyr/types.h>
 #include <zephyr/kernel.h>
+#include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/uart.h>
 
 #include <zephyr/device.h>
@@ -27,7 +28,9 @@
 #include <dk_buttons_and_leds.h>
 
 #include <zephyr/settings/settings.h>
+#include <zephyr/storage/flash_map.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -43,8 +46,12 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #define FUSION_THREAD_STACK_SIZE 1024
 #define FUSION_ADVANCED_THREAD_STACK_SIZE 1536
-#define FUSION_SAMPLE_RATE_HZ 100
+#define FUSION_SAMPLE_RATE_HZ 104
 #define FUSION_LOG_DIVIDER FUSION_SAMPLE_RATE_HZ
+
+#define SENSOR_THREAD_STACK_SIZE 1536
+#define SENSOR_THREAD_PRIORITY 6
+#define IMU_QUEUE_DEPTH 4
 
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN	(sizeof(DEVICE_NAME) - 1)
@@ -63,8 +70,19 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #define NUS_SAFE_PAYLOAD_SIZE 20
 
 static K_SEM_DEFINE(ble_init_ok, 0, 1);
-static K_SEM_DEFINE(nus_init_ok, 0, 2);
+static K_SEM_DEFINE(nus_init_ok, 0, 3);
 static K_MUTEX_DEFINE(nus_tx_mutex);
+
+struct fusion_imu_sample {
+	FusionVector gyroscope;
+	FusionVector accelerometer;
+	int64_t timestamp_us;
+};
+
+K_MSGQ_DEFINE(simple_imu_queue, sizeof(struct fusion_imu_sample),
+	      IMU_QUEUE_DEPTH, 4);
+K_MSGQ_DEFINE(advanced_imu_queue, sizeof(struct fusion_imu_sample),
+	      IMU_QUEUE_DEPTH, 4);
 
 static struct bt_conn *current_conn;
 static struct bt_conn *auth_conn;
@@ -609,6 +627,56 @@ static void configure_gpio(void)
 	}
 }
 
+static int spi_flash_read_write_demo(void)
+{
+	static const uint8_t write_data[] = "nRF54L15 SPI flash demo";
+	uint8_t read_data[sizeof(write_data)];
+	const struct flash_area *area;
+	int err;
+
+	err = flash_area_open(PARTITION_ID(spi_flash_test_partition),
+			      &area);
+	if (err != 0) {
+		LOG_ERR("SPI flash test partition open failed: %d", err);
+		return err;
+	}
+
+	LOG_INF("SPI flash demo: device=%s offset=0x%lx size=%lu",
+		area->fa_dev->name, (unsigned long)area->fa_off,
+		(unsigned long)area->fa_size);
+
+	err = flash_area_erase(area, 0, area->fa_size);
+	if (err != 0) {
+		LOG_ERR("SPI flash erase failed: %d", err);
+		goto close;
+	}
+
+	err = flash_area_write(area, 0, write_data, sizeof(write_data));
+	if (err != 0) {
+		LOG_ERR("SPI flash write failed: %d", err);
+		goto close;
+	}
+
+	memset(read_data, 0, sizeof(read_data));
+	err = flash_area_read(area, 0, read_data, sizeof(read_data));
+	if (err != 0) {
+		LOG_ERR("SPI flash read failed: %d", err);
+		goto close;
+	}
+
+	if (memcmp(write_data, read_data, sizeof(write_data)) != 0) {
+		LOG_ERR("SPI flash readback verification failed");
+		err = -EIO;
+		goto close;
+	}
+
+	LOG_INF("SPI flash read/write verified: %s", read_data);
+
+close:
+	flash_area_close(area);
+	return err;
+}
+
 static int nus_send_data(const uint8_t *data, size_t length)
 {
 	size_t offset = 0;
@@ -631,10 +699,87 @@ static int nus_send_data(const uint8_t *data, size_t length)
 	return err;
 }
 
+static void imu_queue_put_latest(struct k_msgq *queue,
+				 const struct fusion_imu_sample *sample)
+{
+	struct fusion_imu_sample discarded;
+
+	if (k_msgq_put(queue, sample, K_NO_WAIT) == 0) {
+		return;
+	}
+
+	(void)k_msgq_get(queue, &discarded, K_NO_WAIT);
+	(void)k_msgq_put(queue, sample, K_NO_WAIT);
+}
+
+static void sensor_acquisition_thread(void)
+{
+	const struct device *const sensor =
+		DEVICE_DT_GET(DT_NODELABEL(lsm6dso));
+	struct sensor_value gyroscope[3];
+	struct sensor_value accelerometer[3];
+	struct fusion_imu_sample sample;
+	int err;
+
+	k_sem_take(&nus_init_ok, K_FOREVER);
+
+	while (!device_is_ready(sensor)) {
+		static const uint8_t error_message[] = "LSM6DSO:NOT_READY\n";
+
+		LOG_ERR("LSM6DSO Zephyr device is not ready");
+		(void)nus_send_data(error_message, sizeof(error_message) - 1);
+		k_sleep(K_SECONDS(2));
+	}
+
+	LOG_INF("LSM6DSO Zephyr driver ready at 104 Hz");
+
+	for (;;) {
+		err = sensor_sample_fetch(sensor);
+		if (err == 0) {
+			err = sensor_channel_get(sensor, SENSOR_CHAN_GYRO_XYZ,
+						 gyroscope);
+		}
+		if (err == 0) {
+			err = sensor_channel_get(sensor, SENSOR_CHAN_ACCEL_XYZ,
+						 accelerometer);
+		}
+		if (err != 0) {
+			LOG_ERR("LSM6DSO Sensor API read failed: %d", err);
+			k_sleep(K_MSEC(100));
+			continue;
+		}
+
+		sample.gyroscope.axis.x = FusionRadiansToDegrees(
+			(float)sensor_value_to_double(&gyroscope[0]));
+		sample.gyroscope.axis.y = FusionRadiansToDegrees(
+			(float)sensor_value_to_double(&gyroscope[1]));
+		sample.gyroscope.axis.z = FusionRadiansToDegrees(
+			(float)sensor_value_to_double(&gyroscope[2]));
+
+		sample.accelerometer.axis.x =
+			(float)sensor_ms2_to_ug(&accelerometer[0]) / 1000000.0f;
+		sample.accelerometer.axis.y =
+			(float)sensor_ms2_to_ug(&accelerometer[1]) / 1000000.0f;
+		sample.accelerometer.axis.z =
+			(float)sensor_ms2_to_ug(&accelerometer[2]) / 1000000.0f;
+		sample.timestamp_us = k_uptime_get() * 1000;
+
+		imu_queue_put_latest(&simple_imu_queue, &sample);
+		imu_queue_put_latest(&advanced_imu_queue, &sample);
+
+		k_sleep(K_USEC(1000000 / FUSION_SAMPLE_RATE_HZ));
+	}
+}
+
+K_THREAD_DEFINE(sensor_acquisition_thread_id, SENSOR_THREAD_STACK_SIZE,
+		sensor_acquisition_thread, NULL, NULL, NULL,
+		SENSOR_THREAD_PRIORITY, 0, 0);
+
 static void fusion_thread(void)
 {
 	FusionAhrs ahrs;
 	FusionAhrsSettings settings = fusionAhrsDefaultSettings;
+	struct fusion_imu_sample imu_sample;
 	uint32_t sample_count = 0;
 
 	k_sem_take(&nus_init_ok, K_FOREVER);
@@ -646,20 +791,10 @@ static void fusion_thread(void)
 	LOG_INF("Fusion 1.3.3 started at %d Hz", FUSION_SAMPLE_RATE_HZ);
 
 	for (;;) {
-		/*
-		 * The Fusion example uses stationary placeholder measurements.
-		 * Replace these vectors with calibrated IMU samples when an IMU
-		 * driver is added. Gyroscope units are degrees/s and accelerometer
-		 * units are g.
-		 */
-		const FusionVector gyroscope = {
-			.axis = {.x = 0.0f, .y = 0.0f, .z = 0.0f},
-		};
-		const FusionVector accelerometer = {
-			.axis = {.x = 0.0f, .y = 0.0f, .z = 1.0f},
-		};
+		k_msgq_get(&simple_imu_queue, &imu_sample, K_FOREVER);
 
-		FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer);
+		FusionAhrsUpdateNoMagnetometer(&ahrs, imu_sample.gyroscope,
+					       imu_sample.accelerometer);
 
 		if (++sample_count == FUSION_LOG_DIVIDER) {
 			const FusionEuler euler =
@@ -678,8 +813,6 @@ static void fusion_thread(void)
 			}
 			sample_count = 0;
 		}
-
-		k_sleep(K_MSEC(1000 / FUSION_SAMPLE_RATE_HZ));
 	}
 }
 
@@ -694,19 +827,18 @@ static void fusion_advanced_thread(void)
 	const FusionMatrix accelerometer_misalignment = FUSION_MATRIX_IDENTITY;
 	const FusionVector accelerometer_sensitivity = FUSION_VECTOR_ONES;
 	const FusionVector accelerometer_offset = FUSION_VECTOR_ZERO;
-	const FusionMatrix soft_iron_matrix = FUSION_MATRIX_IDENTITY;
-	const FusionVector hard_iron_offset = FUSION_VECTOR_ZERO;
 	FusionAhrs ahrs;
 	FusionBias bias;
 	FusionBiasSettings bias_settings = fusionBiasDefaultSettings;
-	int64_t previous_timestamp;
+	struct fusion_imu_sample imu_sample;
+	int64_t previous_timestamp_us = 0;
 	uint32_t sample_count = 0;
 
 	const FusionAhrsSettings settings = {
 		.sampleRate = (float)FUSION_SAMPLE_RATE_HZ,
 		.convention = FusionConventionNwu,
 		.gain = 0.5f,
-		.gyroscopeRange = 2000.0f,
+		.gyroscopeRange = 250.0f,
 		.accelerationRejection = 10.0f,
 		.magneticRejection = 10.0f,
 		.rejectionTimeout = 5.0f,
@@ -720,22 +852,14 @@ static void fusion_advanced_thread(void)
 	bias_settings.sampleRate = (float)FUSION_SAMPLE_RATE_HZ;
 	FusionBiasSetSettings(&bias, &bias_settings);
 
-	/* Stagger AE, Simple, and AX notifications by about 250 ms. */
-	k_sleep(K_MSEC(250));
-	previous_timestamp = k_uptime_get() -
-			     (1000 / FUSION_SAMPLE_RATE_HZ);
 	LOG_INF("Fusion 1.3.3 advanced started at %d Hz",
 		FUSION_SAMPLE_RATE_HZ);
 
 	for (;;) {
-		const int64_t timestamp = k_uptime_get();
-		FusionVector gyroscope = FUSION_VECTOR_ZERO;
-		FusionVector accelerometer = {
-			.axis = {.x = 0.0f, .y = 0.0f, .z = 1.0f},
-		};
-		FusionVector magnetometer = {
-			.axis = {.x = 1.0f, .y = 0.0f, .z = 0.0f},
-		};
+		k_msgq_get(&advanced_imu_queue, &imu_sample, K_FOREVER);
+
+		FusionVector gyroscope = imu_sample.gyroscope;
+		FusionVector accelerometer = imu_sample.accelerometer;
 
 		gyroscope = FusionModelInertial(
 			gyroscope, gyroscope_misalignment,
@@ -743,18 +867,21 @@ static void fusion_advanced_thread(void)
 		accelerometer = FusionModelInertial(
 			accelerometer, accelerometer_misalignment,
 			accelerometer_sensitivity, accelerometer_offset);
-		magnetometer = FusionModelMagnetic(
-			magnetometer, soft_iron_matrix, hard_iron_offset);
 		gyroscope = FusionBiasUpdate(&bias, gyroscope);
 
-		FusionAhrsSetSamplePeriod(
-			&ahrs, (float)(timestamp - previous_timestamp) / 1000.0f);
-		previous_timestamp = timestamp;
-		FusionAhrsUpdate(&ahrs, gyroscope, accelerometer, magnetometer);
+		if (previous_timestamp_us != 0) {
+			FusionAhrsSetSamplePeriod(
+				&ahrs,
+				(float)(imu_sample.timestamp_us -
+					previous_timestamp_us) /
+					1000000.0f);
+		}
+		previous_timestamp_us = imu_sample.timestamp_us;
+		FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer);
 
 		sample_count++;
 
-		if (sample_count == (FUSION_LOG_DIVIDER / 2)) {
+		if (sample_count == (FUSION_LOG_DIVIDER / 4)) {
 			const FusionEuler euler =
 				FusionQuaternionToEuler(FusionAhrsGetQuaternion(&ahrs));
 			char euler_data[64];
@@ -770,7 +897,7 @@ static void fusion_advanced_thread(void)
 				(void)nus_send_data((const uint8_t *)euler_data,
 						    euler_length);
 			}
-		} else if (sample_count == FUSION_LOG_DIVIDER) {
+		} else if (sample_count == ((FUSION_LOG_DIVIDER * 3) / 4)) {
 			const FusionVector earth =
 				FusionAhrsGetEarthAcceleration(&ahrs);
 			char earth_data[64];
@@ -786,10 +913,11 @@ static void fusion_advanced_thread(void)
 				(void)nus_send_data((const uint8_t *)earth_data,
 						    earth_length);
 			}
-			sample_count = 0;
 		}
 
-		k_sleep(K_MSEC(1000 / FUSION_SAMPLE_RATE_HZ));
+		if (sample_count == FUSION_LOG_DIVIDER) {
+			sample_count = 0;
+		}
 	}
 }
 
@@ -803,6 +931,11 @@ int main(void)
 	int err = 0;
 
 	configure_gpio();
+
+	err = spi_flash_read_write_demo();
+	if (err != 0) {
+		LOG_ERR("SPI flash demo failed: %d", err);
+	}
 
 	err = uart_init();
 	if (err) {
@@ -841,6 +974,7 @@ int main(void)
 		LOG_ERR("Failed to initialize UART service (err: %d)", err);
 		return 0;
 	}
+	k_sem_give(&nus_init_ok);
 	k_sem_give(&nus_init_ok);
 	k_sem_give(&nus_init_ok);
 

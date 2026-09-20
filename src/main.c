@@ -16,6 +16,7 @@
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/sys/atomic.h>
 #include <soc.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
@@ -46,7 +47,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #define FUSION_THREAD_STACK_SIZE 1024
 #define FUSION_ADVANCED_THREAD_STACK_SIZE 1536
-#define FUSION_SAMPLE_RATE_HZ 104
+#define FUSION_SAMPLE_RATE_HZ 100
 #define FUSION_LOG_DIVIDER FUSION_SAMPLE_RATE_HZ
 
 #define SENSOR_THREAD_STACK_SIZE 1536
@@ -72,6 +73,8 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 static K_SEM_DEFINE(ble_init_ok, 0, 1);
 static K_SEM_DEFINE(nus_init_ok, 0, 3);
 static K_MUTEX_DEFINE(nus_tx_mutex);
+static struct k_timer timer_2_5ms;
+static atomic_t timer_2_5ms_flag;
 
 struct fusion_imu_sample {
 	FusionVector gyroscope;
@@ -610,6 +613,19 @@ void button_changed(uint32_t button_state, uint32_t has_changed)
 }
 #endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
 
+static void timer_2_5ms_expiry(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	atomic_set(&timer_2_5ms_flag, 1);
+}
+
+static void configure_2_5ms_timer(void)
+{
+	atomic_clear(&timer_2_5ms_flag);
+	k_timer_init(&timer_2_5ms, timer_2_5ms_expiry, NULL);
+	k_timer_start(&timer_2_5ms, K_USEC(2500), K_USEC(2500));
+}
+
 static void configure_gpio(void)
 {
 	int err;
@@ -714,58 +730,133 @@ static void imu_queue_put_latest(struct k_msgq *queue,
 
 static void sensor_acquisition_thread(void)
 {
-	const struct device *const sensor =
+	const struct device *const lsm6dso =
 		DEVICE_DT_GET(DT_NODELABEL(lsm6dso));
+	const struct device *const lsm303agr =
+		DEVICE_DT_GET(DT_NODELABEL(lsm303agr_accel));
 	struct sensor_value gyroscope[3];
 	struct sensor_value accelerometer[3];
+	struct sensor_value lsm303agr_accelerometer[3];
 	struct fusion_imu_sample sample;
+	uint32_t lsm6dso_error_count = 0;
+	uint32_t lsm303agr_sample_count = 0;
+	uint32_t lsm303agr_error_count = 0;
+	bool lsm6dso_ready;
+	bool lsm303agr_ready;
 	int err;
 
 	k_sem_take(&nus_init_ok, K_FOREVER);
 
-	while (!device_is_ready(sensor)) {
-		static const uint8_t error_message[] = "LSM6DSO:NOT_READY\n";
+	lsm6dso_ready = device_is_ready(lsm6dso);
+	lsm303agr_ready = device_is_ready(lsm303agr);
 
+	while (!lsm6dso_ready && !lsm303agr_ready) {
 		LOG_ERR("LSM6DSO Zephyr device is not ready");
-		(void)nus_send_data(error_message, sizeof(error_message) - 1);
+		LOG_ERR("LSM303AGR accelerometer is not ready");
 		k_sleep(K_SECONDS(2));
+
+		lsm6dso_ready = device_is_ready(lsm6dso);
+		lsm303agr_ready = device_is_ready(lsm303agr);
 	}
 
-	LOG_INF("LSM6DSO Zephyr driver ready at 104 Hz");
+	if (lsm6dso_ready) {
+		LOG_INF("LSM6DSO Zephyr driver ready at 104 Hz");
+	} else {
+		LOG_ERR("LSM6DSO Zephyr device is not ready");
+	}
+
+	if (lsm303agr_ready) {
+		LOG_INF("LSM303AGR accelerometer ready on SPI21 CS P1.07");
+	} else {
+		LOG_ERR("LSM303AGR accelerometer is not ready");
+	}
 
 	for (;;) {
-		err = sensor_sample_fetch(sensor);
-		if (err == 0) {
-			err = sensor_channel_get(sensor, SENSOR_CHAN_GYRO_XYZ,
-						 gyroscope);
-		}
-		if (err == 0) {
-			err = sensor_channel_get(sensor, SENSOR_CHAN_ACCEL_XYZ,
-						 accelerometer);
-		}
-		if (err != 0) {
-			LOG_ERR("LSM6DSO Sensor API read failed: %d", err);
-			k_sleep(K_MSEC(100));
-			continue;
+		if (lsm6dso_ready) {
+			err = sensor_sample_fetch(lsm6dso);
+			if (err == 0) {
+				err = sensor_channel_get(
+					lsm6dso, SENSOR_CHAN_GYRO_XYZ,
+					gyroscope);
+			}
+			if (err == 0) {
+				err = sensor_channel_get(
+					lsm6dso, SENSOR_CHAN_ACCEL_XYZ,
+					accelerometer);
+			}
+
+			if (err == 0) {
+				lsm6dso_error_count = 0;
+				sample.gyroscope.axis.x = FusionRadiansToDegrees(
+					(float)sensor_value_to_double(
+						&gyroscope[0]));
+				sample.gyroscope.axis.y = FusionRadiansToDegrees(
+					(float)sensor_value_to_double(
+						&gyroscope[1]));
+				sample.gyroscope.axis.z = FusionRadiansToDegrees(
+					(float)sensor_value_to_double(
+						&gyroscope[2]));
+
+				sample.accelerometer.axis.x =
+					(float)sensor_ms2_to_ug(
+						&accelerometer[0]) /
+					1000000.0f;
+				sample.accelerometer.axis.y =
+					(float)sensor_ms2_to_ug(
+						&accelerometer[1]) /
+					1000000.0f;
+				sample.accelerometer.axis.z =
+					(float)sensor_ms2_to_ug(
+						&accelerometer[2]) /
+					1000000.0f;
+				sample.timestamp_us = k_uptime_get() * 1000;
+
+				imu_queue_put_latest(&simple_imu_queue, &sample);
+				imu_queue_put_latest(&advanced_imu_queue, &sample);
+			} else if ((lsm6dso_error_count++ %
+				    FUSION_LOG_DIVIDER) == 0) {
+				LOG_ERR("LSM6DSO Sensor API read failed: %d",
+					err);
+			}
 		}
 
-		sample.gyroscope.axis.x = FusionRadiansToDegrees(
-			(float)sensor_value_to_double(&gyroscope[0]));
-		sample.gyroscope.axis.y = FusionRadiansToDegrees(
-			(float)sensor_value_to_double(&gyroscope[1]));
-		sample.gyroscope.axis.z = FusionRadiansToDegrees(
-			(float)sensor_value_to_double(&gyroscope[2]));
+		if (lsm303agr_ready) {
+			err = sensor_sample_fetch(lsm303agr);
+			if (err == 0) {
+				err = sensor_channel_get(
+					lsm303agr, SENSOR_CHAN_ACCEL_XYZ,
+					lsm303agr_accelerometer);
+			}
 
-		sample.accelerometer.axis.x =
-			(float)sensor_ms2_to_ug(&accelerometer[0]) / 1000000.0f;
-		sample.accelerometer.axis.y =
-			(float)sensor_ms2_to_ug(&accelerometer[1]) / 1000000.0f;
-		sample.accelerometer.axis.z =
-			(float)sensor_ms2_to_ug(&accelerometer[2]) / 1000000.0f;
-		sample.timestamp_us = k_uptime_get() * 1000;
+			if (err == 0) {
+				lsm303agr_error_count = 0;
+				lsm303agr_sample_count++;
 
-		imu_queue_put_latest(&simple_imu_queue, &sample);
-		imu_queue_put_latest(&advanced_imu_queue, &sample);
+				if (lsm303agr_sample_count ==
+				    (FUSION_LOG_DIVIDER / 2)) {
+					LOG_INF(
+						"LSM303AGR accel [mg]: x=%d y=%d z=%d",
+						(int)(sensor_ms2_to_ug(
+							&lsm303agr_accelerometer[0]) /
+							1000),
+						(int)(sensor_ms2_to_ug(
+							&lsm303agr_accelerometer[1]) /
+							1000),
+						(int)(sensor_ms2_to_ug(
+							&lsm303agr_accelerometer[2]) /
+							1000));
+				}
+
+				if (lsm303agr_sample_count >=
+				    FUSION_LOG_DIVIDER) {
+					lsm303agr_sample_count = 0;
+				}
+			} else if ((lsm303agr_error_count++ %
+				    FUSION_LOG_DIVIDER) == 0) {
+				LOG_ERR("LSM303AGR Sensor API read failed: %d",
+					err);
+			}
+		}
 
 		k_sleep(K_USEC(1000000 / FUSION_SAMPLE_RATE_HZ));
 	}
@@ -931,6 +1022,7 @@ int main(void)
 	int err = 0;
 
 	configure_gpio();
+	configure_2_5ms_timer();
 
 	err = spi_flash_read_write_demo();
 	if (err != 0) {
